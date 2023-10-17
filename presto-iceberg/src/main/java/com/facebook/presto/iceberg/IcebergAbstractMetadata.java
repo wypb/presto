@@ -15,9 +15,11 @@ package com.facebook.presto.iceberg;
 
 import com.facebook.airlift.json.JsonCodec;
 import com.facebook.airlift.log.Logger;
+import com.facebook.presto.common.Subfield;
 import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.common.type.TypeManager;
 import com.facebook.presto.hive.HiveWrittenPartitions;
+import com.facebook.presto.hive.SubfieldExtractor;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.ConnectorInsertTableHandle;
@@ -30,6 +32,7 @@ import com.facebook.presto.spi.ConnectorTableLayoutHandle;
 import com.facebook.presto.spi.ConnectorTableLayoutResult;
 import com.facebook.presto.spi.ConnectorTableMetadata;
 import com.facebook.presto.spi.Constraint;
+import com.facebook.presto.spi.DiscretePredicates;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.SchemaTablePrefix;
@@ -37,8 +40,13 @@ import com.facebook.presto.spi.SystemTable;
 import com.facebook.presto.spi.TableNotFoundException;
 import com.facebook.presto.spi.connector.ConnectorMetadata;
 import com.facebook.presto.spi.connector.ConnectorOutputMetadata;
+import com.facebook.presto.spi.function.StandardFunctionResolution;
+import com.facebook.presto.spi.relation.RowExpression;
+import com.facebook.presto.spi.relation.RowExpressionService;
+import com.facebook.presto.spi.relation.SpecialFormExpression;
 import com.facebook.presto.spi.statistics.ComputedStatistics;
 import com.facebook.presto.spi.statistics.TableStatistics;
+import com.google.common.base.Functions;
 import com.google.common.base.VerifyException;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -75,9 +83,12 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 import static com.facebook.presto.common.type.BigintType.BIGINT;
+import static com.facebook.presto.expressions.LogicalRowExpressions.TRUE_CONSTANT;
+import static com.facebook.presto.expressions.LogicalRowExpressions.binaryExpression;
 import static com.facebook.presto.iceberg.ExpressionConverter.toIcebergExpression;
 import static com.facebook.presto.iceberg.IcebergColumnHandle.primitiveIcebergColumnHandle;
 import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_INVALID_SNAPSHOT_ID;
+import static com.facebook.presto.iceberg.IcebergSessionProperties.isPushdownFilterEnabled;
 import static com.facebook.presto.iceberg.IcebergTableProperties.FILE_FORMAT_PROPERTY;
 import static com.facebook.presto.iceberg.IcebergTableProperties.FORMAT_VERSION;
 import static com.facebook.presto.iceberg.IcebergTableProperties.LOCATION_PROPERTY;
@@ -108,31 +119,124 @@ public abstract class IcebergAbstractMetadata
 
     protected final TypeManager typeManager;
     protected final JsonCodec<CommitTaskData> commitTaskCodec;
+    private final StandardFunctionResolution functionResolution;
+    private final RowExpressionService rowExpressionService;
 
     protected Transaction transaction;
 
-    public IcebergAbstractMetadata(TypeManager typeManager, JsonCodec<CommitTaskData> commitTaskCodec)
+    public IcebergAbstractMetadata(
+            TypeManager typeManager,
+            StandardFunctionResolution functionResolution,
+            RowExpressionService rowExpressionService,
+            JsonCodec<CommitTaskData> commitTaskCodec)
     {
         this.typeManager = requireNonNull(typeManager, "typeManager is null");
         this.commitTaskCodec = requireNonNull(commitTaskCodec, "commitTaskCodec is null");
+        this.functionResolution = requireNonNull(functionResolution, "functionResolution is null");
+        this.rowExpressionService = requireNonNull(rowExpressionService, "rowExpressionService is null");
     }
 
     protected abstract Table getIcebergTable(ConnectorSession session, SchemaTableName schemaTableName);
 
     protected abstract boolean tableExists(ConnectorSession session, SchemaTableName schemaTableName);
 
+    /**
+     * This class implements the default implementation for getTableLayouts which will be used in the case of a Java Worker
+     */
     @Override
-    public List<ConnectorTableLayoutResult> getTableLayouts(ConnectorSession session, ConnectorTableHandle table, Constraint<ColumnHandle> constraint, Optional<Set<ColumnHandle>> desiredColumns)
+    public List<ConnectorTableLayoutResult> getTableLayouts(
+            ConnectorSession session,
+            ConnectorTableHandle table,
+            Constraint<ColumnHandle> constraint,
+            Optional<Set<ColumnHandle>> desiredColumns)
     {
         IcebergTableHandle handle = (IcebergTableHandle) table;
-        ConnectorTableLayout layout = new ConnectorTableLayout(new IcebergTableLayoutHandle(handle, constraint.getSummary()));
+
+        Map<String, IcebergColumnHandle> predicateColumns = constraint.getSummary().getDomains().get().keySet().stream()
+                .map(IcebergColumnHandle.class::cast)
+                .collect(toImmutableMap(IcebergColumnHandle::getName, Functions.identity()));
+
+        Optional<Set<IcebergColumnHandle>> requestedColumns = desiredColumns.map(columns -> columns.stream().map(column -> (IcebergColumnHandle) column).collect(toImmutableSet()));
+        ConnectorTableLayout layout = getTableLayout(
+                session,
+                new IcebergTableLayoutHandle(
+                        constraint.getSummary().transform(IcebergAbstractMetadata::toSubfield),
+                        TRUE_CONSTANT,
+                        predicateColumns,
+                        requestedColumns,
+                        isPushdownFilterEnabled(session),
+                        handle));
         return ImmutableList.of(new ConnectorTableLayoutResult(layout, constraint.getSummary()));
+    }
+
+    public static Subfield toSubfield(ColumnHandle columnHandle)
+    {
+        return new Subfield(((IcebergColumnHandle) columnHandle).getName(), ImmutableList.of());
+    }
+
+    protected static boolean isEntireColumn(Subfield subfield)
+    {
+        return subfield.getPath().isEmpty();
     }
 
     @Override
     public ConnectorTableLayout getTableLayout(ConnectorSession session, ConnectorTableLayoutHandle handle)
     {
-        return new ConnectorTableLayout(handle);
+        if (!isPushdownFilterEnabled(session)) {
+            return new ConnectorTableLayout(handle);
+        }
+
+        IcebergTableLayoutHandle icebergTableLayoutHandle = (IcebergTableLayoutHandle) handle;
+
+        IcebergTableHandle tableHandle = icebergTableLayoutHandle.getTable();
+        if (!tableExists(session, tableHandle.getSchemaTableName())) {
+            return null;
+        }
+
+        Table icebergTable = getIcebergTable(session, tableHandle.getSchemaTableName());
+
+        Optional<DiscretePredicates> discretePredicates = Optional.empty();
+
+        TupleDomain<ColumnHandle> predicate;
+        RowExpression subfieldPredicate;
+        if (icebergTableLayoutHandle.isPushdownFilterEnabled()) {
+            predicate = icebergTableLayoutHandle.getDomainPredicate()
+                    .transform(subfield -> isEntireColumn(subfield) ? subfield.getRootName() : null)
+                    .transform(icebergTableLayoutHandle.getPredicateColumns()::get)
+                    .transform(ColumnHandle.class::cast);
+
+            // capture subfields from domainPredicate to add to remainingPredicate
+            // so those filters don't get lost
+            Map<String, com.facebook.presto.common.type.Type> columnTypes = getColumns(icebergTable.schema(), typeManager).stream()
+                    .collect(toImmutableMap(IcebergColumnHandle::getName, icebergColumnHandle -> getColumnMetadata(session, tableHandle, icebergColumnHandle).getType()));
+            SubfieldExtractor subfieldExtractor = new SubfieldExtractor(functionResolution, rowExpressionService.getExpressionOptimizer(), session);
+
+            subfieldPredicate = rowExpressionService.getDomainTranslator().toPredicate(
+                    icebergTableLayoutHandle.getDomainPredicate()
+                            .transform(subfield -> !isEntireColumn(subfield) ? subfield : null)
+                            .transform(subfield -> subfieldExtractor.toRowExpression(subfield, columnTypes.get(subfield.getRootName()))));
+        }
+        else {
+            // TODO: Need to implement, still incomplete
+            predicate = TupleDomain.none();
+            subfieldPredicate = TRUE_CONSTANT;
+        }
+
+        // combine subfieldPredicate with remainingPredicate
+        List<RowExpression> predicatesToCombine = ImmutableList.of(subfieldPredicate, icebergTableLayoutHandle.getRemainingPredicate()).stream()
+                .filter(p -> !p.equals(TRUE_CONSTANT))
+                .collect(toImmutableList());
+        RowExpression combinedRemainingPredicate = binaryExpression(SpecialFormExpression.Form.AND, predicatesToCombine);
+
+        return new ConnectorTableLayout(
+                icebergTableLayoutHandle,
+                Optional.empty(),
+                predicate,
+                Optional.empty(),
+                Optional.empty(),
+                discretePredicates,
+                ImmutableList.of(),
+                Optional.of(combinedRemainingPredicate));
     }
 
     protected Optional<SystemTable> getIcebergSystemTable(SchemaTableName tableName, Table table)
@@ -286,6 +390,12 @@ public abstract class IcebergAbstractMetadata
     public ColumnHandle getUpdateRowIdColumnHandle(ConnectorSession session, ConnectorTableHandle tableHandle)
     {
         return primitiveIcebergColumnHandle(0, "$row_id", BIGINT, Optional.empty());
+    }
+
+    @Override
+    public boolean isLegacyGetLayoutSupported(ConnectorSession session, ConnectorTableHandle tableHandle)
+    {
+        return !isPushdownFilterEnabled(session);
     }
 
     protected List<ColumnMetadata> getColumnMetadatas(Table table)
@@ -484,7 +594,10 @@ public abstract class IcebergAbstractMetadata
         // Allow metadata delete for range filters on partition columns.
         IcebergTableLayoutHandle layoutHandle = (IcebergTableLayoutHandle) tableLayoutHandle.get();
 
-        TupleDomain<ColumnHandle> domainPredicate = layoutHandle.getTupleDomain();
+        TupleDomain<ColumnHandle> domainPredicate = layoutHandle.getDomainPredicate()
+                .transform(subfield -> isEntireColumn(subfield) ? subfield.getRootName() : null)
+                .transform(layoutHandle.getPredicateColumns()::get)
+                .transform(ColumnHandle.class::cast);
         if (domainPredicate.isAll()) {
             return true;
         }
@@ -527,7 +640,11 @@ public abstract class IcebergAbstractMetadata
         }
 
         TableScan scan = icebergTable.newScan();
-        TupleDomain<ColumnHandle> domainPredicate = layoutHandle.getTupleDomain();
+
+        TupleDomain<ColumnHandle> domainPredicate = layoutHandle.getDomainPredicate()
+                .transform(subfield -> isEntireColumn(subfield) ? subfield.getRootName() : null)
+                .transform(layoutHandle.getPredicateColumns()::get)
+                .transform(ColumnHandle.class::cast);
         if (!domainPredicate.isAll()) {
             Expression filterExpression = toIcebergExpression(handle.getPredicate());
             scan = scan.filter(filterExpression);
