@@ -13,11 +13,11 @@
  */
 package com.facebook.presto.iceberg.delete;
 
+import com.facebook.presto.iceberg.FileFormat;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.collect.ImmutableList;
 import org.apache.iceberg.FileContent;
-import org.apache.iceberg.FileFormat;
 
 import java.nio.ByteBuffer;
 import java.util.List;
@@ -42,7 +42,7 @@ public class DeleteFile
         return new DeleteFile(
                 deleteFile.content(),
                 deleteFile.path().toString(),
-                deleteFile.format(),
+                FileFormat.valueOf(deleteFile.format().name()),
                 deleteFile.recordCount(),
                 deleteFile.fileSizeInBytes(),
                 Optional.ofNullable(deleteFile.equalityFieldIds()).orElseGet(ImmutableList::of),

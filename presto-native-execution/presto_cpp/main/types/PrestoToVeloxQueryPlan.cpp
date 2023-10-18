@@ -136,6 +136,16 @@ std::shared_ptr<connector::ColumnHandle> toColumnHandle(
         toRequiredSubfields(hiveColumn->requiredSubfields));
   }
 
+  if (auto icebergColumn =
+          dynamic_cast<const protocol::IcebergColumnHandle*>(column)) {
+    return std::make_shared<connector::hive::HiveColumnHandle>(
+        icebergColumn->columnIdentity.name,
+        toHiveColumnType(icebergColumn->columnType),
+        stringToType(icebergColumn->type),
+        hiveTypeParser.parse(icebergColumn->type),
+        toRequiredSubfields(icebergColumn->requiredSubfields));
+  }
+
   if (auto tpchColumn =
           dynamic_cast<const protocol::TpchColumnHandle*>(column)) {
     return std::make_shared<connector::tpch::TpchColumnHandle>(
@@ -866,6 +876,69 @@ std::shared_ptr<connector::ConnectorTableHandle> toConnectorTableHandle(
         tableHandle.connectorId,
         tableName,
         hiveLayout->pushdownFilterEnabled,
+        std::move(subfieldFilters),
+        remainingFilter,
+        dataColumns,
+        tableParameters);
+  }
+
+  if (auto icebergLayout =
+          std::dynamic_pointer_cast<const protocol::IcebergTableLayoutHandle>(
+              tableHandle.connectorTableLayout)) {
+
+    connector::hive::SubfieldFilters subfieldFilters;
+    auto domains = icebergLayout->domainPredicate.domains;
+    for (const auto& domain : *domains) {
+      auto filter = domain.second;
+      subfieldFilters[common::Subfield(domain.first)] =
+          toFilter(domain.second, exprConverter);
+    }
+
+    auto remainingFilter =
+        exprConverter.toVeloxExpr(icebergLayout->remainingPredicate);
+    if (auto constant =
+            std::dynamic_pointer_cast<const core::ConstantTypedExpr>(
+                remainingFilter)) {
+      bool value = constant->value().value<bool>();
+      VELOX_CHECK(value, "Unexpected always-false remaining predicate");
+
+      // Use null for always-true filter.
+      remainingFilter = nullptr;
+    }
+
+    RowTypePtr dataColumns;
+    if (!icebergLayout->requestedColumns->empty()) {
+      std::vector<std::string> names;
+      std::vector<TypePtr> types;
+      velox::type::fbhive::HiveTypeParser typeParser;
+      names.reserve(icebergLayout->requestedColumns->size());
+      types.reserve(icebergLayout->requestedColumns->size());
+
+      for (const auto& column : *icebergLayout->requestedColumns) {
+        names.push_back(column.columnIdentity.name);
+        types.push_back(typeParser.parse(column.type));
+      }
+      dataColumns = ROW(std::move(names), std::move(types));
+    }
+
+    auto icebergTableHandle =
+        std::dynamic_pointer_cast<const protocol::IcebergTableHandle>(
+            tableHandle.connectorHandle);
+    VELOX_CHECK_NOT_NULL(icebergTableHandle);
+
+    // Use fully qualified name if available.
+    std::string tableName = icebergTableHandle->schemaName.empty()
+        ? icebergTableHandle->tableName
+        : fmt::format(
+              "{}.{}", icebergTableHandle->schemaName, icebergTableHandle->tableName);
+
+    std::unordered_map<std::string, std::string> tableParameters;
+    tableParameters.reserve(0);
+
+    return std::make_shared<connector::hive::HiveTableHandle>(
+        tableHandle.connectorId,
+        tableName,
+        icebergLayout->pushdownFilterEnabled,
         std::move(subfieldFilters),
         remainingFilter,
         dataColumns,

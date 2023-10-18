@@ -14,7 +14,6 @@
 package com.facebook.presto.iceberg;
 
 import com.facebook.airlift.bootstrap.LifeCycleManager;
-import com.facebook.presto.hive.HiveTransactionHandle;
 import com.facebook.presto.spi.SystemTable;
 import com.facebook.presto.spi.classloader.ThreadContextClassLoader;
 import com.facebook.presto.spi.connector.Connector;
@@ -178,7 +177,7 @@ public class IcebergConnector
     public ConnectorTransactionHandle beginTransaction(IsolationLevel isolationLevel, boolean readOnly)
     {
         checkConnectorSupports(SERIALIZABLE, isolationLevel);
-        ConnectorTransactionHandle transaction = new HiveTransactionHandle();
+        ConnectorTransactionHandle transaction = new IcebergTransactionHandle();
         try (ThreadContextClassLoader ignored = new ThreadContextClassLoader(getClass().getClassLoader())) {
             transactionManager.put(transaction, metadataFactory.create());
         }

@@ -14,7 +14,6 @@
 package com.facebook.presto.iceberg;
 
 import com.facebook.presto.hive.HivePartitionKey;
-import com.facebook.presto.iceberg.delete.DeleteFile;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.ConnectorSplit;
 import com.facebook.presto.spi.ConnectorSplitSource;
@@ -45,7 +44,6 @@ import java.util.concurrent.CompletableFuture;
 
 import static com.facebook.presto.iceberg.IcebergSessionProperties.getNodeSelectionStrategy;
 import static com.facebook.presto.iceberg.IcebergUtil.getIdentityPartitions;
-import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.Iterators.limit;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Objects.requireNonNull;
@@ -120,12 +118,11 @@ public class IcebergSplitSource
                 task.file().path().toString(),
                 task.start(),
                 task.length(),
-                task.file().format(),
+                FileFormat.valueOf(task.file().format().name()),
                 ImmutableList.of(),
                 getPartitionKeys(task),
                 getNodeSelectionStrategy(session),
-                SplitWeight.fromProportion(Math.min(Math.max((double) task.length() / tableScan.targetSplitSize(), minimumAssignedSplitWeight), 1.0)),
-                task.deletes().stream().map(DeleteFile::fromIceberg).collect(toImmutableList()));
+                SplitWeight.fromProportion(Math.min(Math.max((double) task.length() / tableScan.targetSplitSize(), minimumAssignedSplitWeight), 1.0)));
     }
 
     private static Map<Integer, HivePartitionKey> getPartitionKeys(FileScanTask scanTask)

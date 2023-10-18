@@ -166,8 +166,10 @@ public class IcebergColumnHandle
 
     public enum ColumnType
     {
+        PARTITION_KEY,
         REGULAR,
-        SYNTHESIZED
+        SYNTHESIZED,
+        AGGREGATED,
     }
 
     public static Subfield getPushedDownSubfield(IcebergColumnHandle column)
