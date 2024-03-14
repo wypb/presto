@@ -383,24 +383,31 @@ public class IcebergEqualityDeleteAsJoin
                             if (!partitionField.transform().isIdentity()) {
                                 Type partitionFieldType = partitionField.transform().getResultType(sourceField.type());
                                 VariableReferenceExpression variableReference = variableAllocator.newVariable(partitionField.name(), toPrestoType(partitionFieldType, typeManager));
-                                IcebergColumnHandle columnHandle = new IcebergColumnHandle(
-                                        ColumnIdentity.createColumnIdentity(partitionField.name(), partitionField.fieldId(), partitionFieldType),
-                                        toPrestoType(partitionFieldType, typeManager),
-                                        Optional.empty(),
-                                        PARTITION_KEY);
-                                unselectedAssignmentsBuilder.put(variableReference, columnHandle);
+                                if (!selectedFields.contains(partitionField.fieldId())) {
+                                    IcebergColumnHandle columnHandle = new IcebergColumnHandle(
+                                            ColumnIdentity.createColumnIdentity(partitionField.name(), partitionField.fieldId(), partitionFieldType),
+                                            toPrestoType(partitionFieldType, typeManager),
+                                            Optional.empty(),
+                                            PARTITION_KEY);
+                                    unselectedAssignmentsBuilder.put(variableReference, columnHandle);
+                                    selectedFields.add(partitionField.fieldId());
+                                }
                             }
                             else if (!selectedFields.contains(sourceField.fieldId())) {
                                 unselectedAssignmentsBuilder.put(
                                         variableAllocator.newVariable(sourceField.name(), toPrestoType(sourceField.type(), typeManager)),
                                         IcebergColumnHandle.create(sourceField, typeManager, REGULAR));
+                                selectedFields.add(sourceField.fieldId());
                             }
                         }
                         else {
                             Types.NestedField schemaField = icebergTable.schema().findField(fieldId);
-                            unselectedAssignmentsBuilder.put(
-                                    variableAllocator.newVariable(schemaField.name(), toPrestoType(schemaField.type(), typeManager)),
-                                    IcebergColumnHandle.create(schemaField, typeManager, REGULAR));
+                            if (!selectedFields.contains(schemaField.fieldId())) {
+                                unselectedAssignmentsBuilder.put(
+                                        variableAllocator.newVariable(schemaField.name(), toPrestoType(schemaField.type(), typeManager)),
+                                        IcebergColumnHandle.create(schemaField, typeManager, REGULAR));
+                                selectedFields.add(schemaField.fieldId());
+                            }
                         }
                     });
             return unselectedAssignmentsBuilder.build();
